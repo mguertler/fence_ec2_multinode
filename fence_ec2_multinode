@@ -1,0 +1,219 @@
+#!/bin/bash
+
+description="
+fence_ec2_multinode is an I/O Fencing agent which can be used with Amazon EC2 instances.
+The agent requires properly setup roles for the instances in order to allow them to execute the following EC2 API functions.
+
+API functions used by this agent:
+- ec2-describe-tags
+- ec2-describe-instances
+- ec2-stop-instances
+- ec2-start-instances
+
+Each instance must have two EC2 instance tags:
+1. Instance tag 'Hostname', which is the hostname of a node (as it appears as nodename in the cluster)
+2. Instance tag 'Clustername', which is an arbritary string that must be unique for all nodes in a cluster
+
+The agent starts/stops/resets the cluster nodes using Amazon ec2-stop-instance and ec2-start-instance commands. In order to
+map an EC2 instance name to a node hostname, it uses the EC2 instance tag 'Hostname'. To identify all cluster nodes
+that belong to his cluster, it uses the EC2 instance tag 'Clustername'. Make sure to set these instance tags for your
+stances before using this fencing agent!
+
+"
+
+#
+# Copyright (c) 2015 Markus Guertler (SUSE)
+# Based on code of fence_ec2 from Andrew Beekhof
+# 
+#                    All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+#######################################################################
+
+#######################################################################
+#
+# Functions
+#
+#######################################################################
+
+# Initializes some variables and does some sanity checks
+function init_agent()
+{
+ha_log.sh debug "action: $action"
+ha_log.sh debug "node to fence: $node_to_fence"
+ha_log.sh debug "ec2_home: $ec2_home"
+ha_log.sh debug "clustername: $clustername"
+
+if [ -z "$ec2_home" ]; then
+    ec2_home="$HOME/.ec2"
+fi
+
+for cmd in ec2-stop-instances ec2-start-instances ec2-describe-instances ec2-describe-tags; do
+	if [ ! -x "$ec2_home/bin/$cmd" ]; then
+		ha_log.sh err "Couldn't find EC2 command $cmd in $ec2_home/bin! Have you installed the Amazon tools and set the agent parameter ec2_home?"
+		exit 1
+		echo
+	fi
+done
+
+
+if [ -z "$JAVA_HOME" ]; then
+    java=`which java`
+    while [ -L "$java" ]; do
+        java=`/bin/ls -l $java | awk '{print $11}'`
+    done
+    export JAVA_HOME=`dirname $java`/..
+fi
+
+# Set directory to EC2 API commands 
+export EC2_HOME=$ec2_home
+PATH="$PATH:$ec2_home/bin"
+
+}
+
+function getinfo_xml()
+{
+cat << EOF
+<parameters>
+<parameter name="ec2_home" unique="1" required="0">
+	<content type="string" default="~/.ec2" />
+	<shortdesc lang="en">Location of Amazon EC2 API tools directory</shortdesc>
+	<longdesc lang="en">Location of Amazon EC2 API tools directory (without the /bin subdirectory!)</longdesc>
+</parameter>
+<parameter name="clustername" unique="1" required="1">
+	<content type="string" />
+	<shortdesc lang="en">Name of the cluster, as defined with instance tag 'Clustername'</shortdesc>
+	<longdesc lang="en">Name of the cluster, as defined with instance tag 'Clustername'. The value must be unique for this cluster and the EC2 instance tag 'Clustername' must be defined for all nodes belonging to this cluster. Additionally, don't forget to set the EC2 instance tag 'Hostname'!</longdesc>
+</parameter>
+</parameters>
+EOF
+exit 0;
+}
+
+# Sets global variable $instance to the instance name of a cluster node belonging to a cluster
+# Expects
+# ... the name of a cluster (Clustername tag)
+# ... the node name of a cluster (Hostname tag)
+function set_instance_name()
+{
+	local cluster_name="$1"
+	local node_name="$2"
+	instance=$(ec2-describe-instances --filter "tag-key=Clustername" --filter "tag-value=$cluster_name" |grep "^TAG.*Hostname" | awk '{ print $3 ":" $5 }' |grep "$node_name" | cut -d: -f1)
+
+	if [ -z "$instance" ]; then
+		ha_log.sh err "Couldn't find instance name for $node_name!"
+		exit 1
+	fi
+	return 0
+}
+
+# Waits until a instance is being stopped
+# Expects
+# ... the instance name of the node that is being stopped
+# ... the hostname of the node that is being stopeed
+function wait_for_stopped()
+{
+	local instance_name=$1
+	local node_name=$2
+	while ! ec2-describe-instances $instance | grep -q stopped ; do
+		ha_log.sh debug "Waiting for $node_name (instance: $instance_name) to be stopped"
+		sleep 5
+	done
+	return 0
+}
+
+#######################################################################
+#
+# MAIN
+#
+#######################################################################
+
+action=$1
+node_to_fence=$2
+
+ha_log.sh debug "Executing action: ${action}"
+
+case ${action} in 
+    gethosts)
+	# List of hostnames of this cluster
+	init_agent
+	ec2-describe-instances --filter "tag-key=Clustername" --filter "tag-value=$clustername" | grep "^TAG" |grep "Hostname" | awk '{ print $5 }' | sort -u
+	;;
+    reset) 
+        # Force stop of instance, wait for success
+	init_agent
+        set_instance_name "$clustername" "$node_to_fence"
+	ha_log.sh debug "force stopping $instance..."
+        ec2-stop-instances "$instance" --force
+	wait_for_stopped $instance $node_to_fence
+	ha_log.sh debug "Starting $instance..."
+	ec2-start-instances $instance
+	;;
+    on)
+	init_agent
+	ha_log.sh debug "Starting $instance..."
+        set_instance_name "$clustername" "$node_to_fence"
+	ec2-start-instances $instance
+	;;
+    off)
+    	# Force stop of instance, wait for success
+	init_agent
+	ha_log.sh debug "force stopping $instance..."
+        set_instance_name "$clustername" "$node_to_fence"
+    	ec2-stop-instances "$instance" --force
+	wait_for_stopped "$instance" "$node_to_fence"
+	;;
+    status)
+	# List of instances and their current status
+	init_agent
+	ec2-describe-instances --filter "tag-key=Clustername" --filter "tag-value=$clustername" | grep "^INSTANCE"
+	if [ $? -gt 0 ]; then
+		ha_log.sh debug "Couldn't find any instance with tag Clustername=$clustername"
+		exit 1
+	fi
+	;;
+    getinfo-xml)
+	getinfo_xml
+	;;
+    getconfignames)
+        for i in ec2_home clustername; do
+                echo $i
+        done
+        exit 0
+        ;;
+    getinfo-devid)
+        echo "EC2 STONITH device"
+        exit 0
+        ;;
+    getinfo-devname)
+        echo "EC2 STONITH external device"
+        exit 0
+        ;;
+    getinfo-devdescr)
+        echo "$description"
+        exit 0
+        ;;
+    getinfo-devurl)
+        echo "http://www.linux-ha.org/"
+        exit 0
+        ;;
+    *) exit 1;;
+esac
